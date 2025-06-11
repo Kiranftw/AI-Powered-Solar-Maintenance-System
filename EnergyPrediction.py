@@ -3,26 +3,35 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import os
 import google.generativeai as genai
 import logging
+from dotenv import load_dotenv, find_dotenv
 from functools import wraps
 import logging
 import joblib
+from pyspark.sql import SparkSession
+from pyspark.ml import PipelineModel
+from pyspark.sql import Row
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class EnergyPrediction(object):
     def __init__(self) -> None:
+        load_dotenv(find_dotenv())
         self.DIR = os.path.dirname(os.path.abspath(__file__))
         for filename in os.listdir(self.DIR):
             if filename.endswith('.csv') and filename == "Processed_data.csv":
                 self.dataframe: pd.DataFrame = pd.read_csv(os.path.join(self.DIR, filename))
                 logging.info(f"Loaded data from {filename}")
         self.RegressionModel: LinearRegression = LinearRegression()
+        self.ForestModel: RandomForestRegressor = RandomForestRegressor(n_estimators=100, random_state=42)
         self.modelpath = os.path.join(self.DIR, "energy_prediction_model.pkl")
-    
+        self.sparksession = SparkSession.builder.appName("SolarMaintenence Model").getOrCreate()
+        
+    @staticmethod
     def ExceptionHandelling(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -68,27 +77,39 @@ class EnergyPrediction(object):
 
         prediction = model.predict(input_df)
         logging.info(f"Predicted Module Temperature: {prediction[0]}")
-        return prediction[0]
+        return float(prediction[0])
+    
+    @ExceptionHandelling
+    def ModelPrediction(self):
+        dc_model_path = os.path.join(self.DIR, "models", "DC_POWER_MODEL")
+        ac_model_path = os.path.join(self.DIR, "models", "AC_POWER_MODEL")
+        
+        dc_model = PipelineModel.load(dc_model_path)
+        ac_model = PipelineModel.load(ac_model_path)
 
-def main():
-    predictor = EnergyPrediction()
+        month = int(input("Enter month: "))
+        day = int(input("Enter day: "))
+        ambient_temperature = float(input("Enter ambient temperature: "))
+        irradiation = float(input("Enter irradiation: "))
 
-    ambient_temperatures = predictor.dataframe['AMBIENT_TEMPERATURE'].iloc[:100].values
-    irradiations = predictor.dataframe['IRRADIATION'].iloc[:100].values
+        module_temperature = self.predictModuleTemperature(ambient_temperature, irradiation)
+        print(f"Predicted Module Temperature: {module_temperature}")
+        if module_temperature is None:
+            return
+        
+        
+        InputRow = Row("month", "day_of_month", "AMBIENT_TEMPERATURE", "MODULE_TEMPERATURE", "IRRADIATION")
+        input_row = InputRow(month, day, ambient_temperature, module_temperature, irradiation)
 
-    if not os.path.exists(predictor.modelpath):
-        print("Model not trained. Training now...")
-        predictor.modeltraining()
+        input_df = self.sparksession.createDataFrame([input_row])
 
-    predictor.RegressionModel = joblib.load(predictor.modelpath)
+        # Run predictions
+        dc_pred = dc_model.transform(input_df).select("prediction").first()[0]
+        ac_pred = ac_model.transform(input_df).select("prediction").first()[0]
 
-    predictions = []
-    for at, ir in zip(ambient_temperatures, irradiations):
-        prediction = predictor.predictModuleTemperature(at, ir)
-        predictions.append(float(prediction))
-
-    print("Predictions for first 100 records:")
-    print(predictions)
+        print(f"DC Prediction: {dc_pred}")
+        print(f"AC Prediction: {ac_pred}")
 
 if __name__ == "__main__":
-    main()
+    energy_prediction = EnergyPrediction()
+    energy_prediction.ModelPrediction()
