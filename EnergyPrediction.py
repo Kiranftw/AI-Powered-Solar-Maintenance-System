@@ -15,6 +15,8 @@ import joblib
 from pyspark.sql import SparkSession
 from pyspark.ml import PipelineModel
 from pyspark.sql import Row
+import requests
+import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -30,7 +32,9 @@ class EnergyPrediction(object):
         self.ForestModel: RandomForestRegressor = RandomForestRegressor(n_estimators=100, random_state=42)
         self.modelpath = os.path.join(self.DIR, "energy_prediction_model.pkl")
         self.sparksession = SparkSession.builder.appName("SolarMaintenence Model").getOrCreate()
-        
+        self.WEATHER_API = os.getenv("WEATHER_API")
+        print(self.WEATHER_API)
+
     @staticmethod
     def ExceptionHandelling(func):
         @wraps(func)
@@ -41,7 +45,7 @@ class EnergyPrediction(object):
                 logging.error(f"An error occurred in {func.__name__}: {e}")
                 raise
         return wrapper
-    
+   
     @ExceptionHandelling
     #NOTE: 
     def modeltraining(self) -> None:
@@ -80,6 +84,44 @@ class EnergyPrediction(object):
         return float(prediction[0])
     
     @ExceptionHandelling
+    def getWeatherData(self,latitude, longitude, days: int) -> pd.DataFrame:
+        api_url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "hourly": "temperature_2m,shortwave_radiation",
+            "timezone": "auto",
+            "forecast_days": days
+        }
+
+        try:
+            response = requests.get(api_url, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+            df = pd.DataFrame(data['hourly'])
+            df['time'] = pd.to_datetime(df['time'])
+            df.rename(columns={
+                'time': 'Timestamp',
+                'temperature_2m': 'Ambient Temp (°C)',
+                'shortwave_radiation': 'Irradiance (W/m²)'
+            }, inplace=True)
+
+            # Interpolate to 15-minute intervals
+            df.set_index('Timestamp', inplace=True)
+            interpolated_df: pd.DataFrame = df.resample('15min').interpolate(method='linear')
+            interpolated_df.reset_index(inplace=True)
+
+            return interpolated_df
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching data: {e}")
+            return None
+        except KeyError:
+            print("Error: Unexpected data format received from API.")
+            return None
+        
+    @ExceptionHandelling
     def ModelPrediction(self):
         dc_model_path = os.path.join(self.DIR, "models", "DC_POWER_MODEL")
         ac_model_path = os.path.join(self.DIR, "models", "AC_POWER_MODEL")
@@ -97,19 +139,37 @@ class EnergyPrediction(object):
         if module_temperature is None:
             return
         
-        
         InputRow = Row("month", "day_of_month", "AMBIENT_TEMPERATURE", "MODULE_TEMPERATURE", "IRRADIATION")
         input_row = InputRow(month, day, ambient_temperature, module_temperature, irradiation)
 
         input_df = self.sparksession.createDataFrame([input_row])
 
-        # Run predictions
         dc_pred = dc_model.transform(input_df).select("prediction").first()[0]
         ac_pred = ac_model.transform(input_df).select("prediction").first()[0]
 
         print(f"DC Prediction: {dc_pred}")
         print(f"AC Prediction: {ac_pred}")
 
+    @ExceptionHandelling
+    def dataGeneration(self, latitude: float = 17.3850, longitude: float =  78.4867) -> pd.DataFrame:
+        dataframe: pd.DataFrame = self.getWeatherData(latitude, longitude, days=5)
+        if dataframe is None:
+            logging.error("Failed to fetch weather data.")
+            return None
+        logging.info("REAL TIME WEATHER DATA")
+        #NOTE.: The weather API is giving irradiance in W/m², we need to convert it to kW/m² -> kWh_per_m2 = (irradiance_W_per_m2) * (15 / 60) / 1000
+        dataframe['IRRADIATION (kWh/m²)'] = (dataframe['Irradiance (W/m²)'] * (15 / 60)) / 1000
+        moduleTemperature = list()
+        for index, row in dataframe.iterrows():
+            ambient_temperature = row['Ambient Temp (°C)']
+            irradiation = row['IRRADIATION (kWh/m²)']
+            module_temp = self.predictModuleTemperature(ambient_temperature, irradiation)
+            if module_temp is not None:
+                moduleTemperature.append(module_temp)
+            else:
+                moduleTemperature.append(None)
+        dataframe['MODULE_TEMPERATURE'] = moduleTemperature
+
 if __name__ == "__main__":
     energy_prediction = EnergyPrediction()
-    energy_prediction.ModelPrediction()
+    energy_prediction.dataGeneration()
