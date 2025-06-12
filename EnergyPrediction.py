@@ -204,22 +204,8 @@ class EnergyPrediction(object):
         if dataframe is None or dataframe.empty:
             logging.error("Dataframe is empty or None.")
             return None
-        # Assuming 'MODULE_TEMPERATURE' is the column to check for anomalies
-        sns.boxplot(data=dataframe, x='MODULE_TEMPERATURE')
-        plt.title('Anomaly Detection in Module Temperature')
-        plt.show()
         
-        # Simple anomaly detection using Z-score
-        dataframe['Z_SCORE'] = (dataframe['MODULE_TEMPERATURE'] - dataframe['MODULE_TEMPERATURE'].mean()) / dataframe['MODULE_TEMPERATURE'].std()
-        anomalies = dataframe[dataframe['Z_SCORE'].abs() > 3]
-        
-        if not anomalies.empty:
-            logging.info(f"Anomalies detected: {len(anomalies)}")
-            print(anomalies)
-        else:
-            logging.info("No anomalies detected.")
-        
-        return anomalies
+
 
 if __name__ == "__main__":
     energy_prediction = EnergyPrediction()
