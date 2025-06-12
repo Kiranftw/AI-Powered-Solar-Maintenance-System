@@ -12,11 +12,13 @@ from dotenv import load_dotenv, find_dotenv
 from functools import wraps
 import logging
 import joblib
+
 from pyspark.sql import SparkSession
 from pyspark.ml import PipelineModel
 from pyspark.sql import Row
 import requests
 import datetime
+import time
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -33,7 +35,14 @@ class EnergyPrediction(object):
         self.modelpath = os.path.join(self.DIR, "energy_prediction_model.pkl")
         self.sparksession = SparkSession.builder.appName("SolarMaintenence Model").getOrCreate()
         self.WEATHER_API = os.getenv("WEATHER_API")
-        print(self.WEATHER_API)
+        genai.configure(api_key=os.getenv("GENAI_API_KEY"))
+        for model in genai.list_models():
+            print(model.name)
+        self.MODEL: genai.GenerativeModel = genai.GenerativeModel(
+            model_name = "gemini-1.5-flash",
+            generation_config = {"application/memetype": "text/plain"}
+        )
+        print(self.model)
 
     @staticmethod
     def ExceptionHandelling(func):
@@ -122,23 +131,16 @@ class EnergyPrediction(object):
             return None
         
     @ExceptionHandelling
-    def ModelPrediction(self):
+    def ModelPrediction(self, month: int, day: int, ambient_temperature: float, irradiation: float, module_temperature: float):
         dc_model_path = os.path.join(self.DIR, "models", "DC_POWER_MODEL")
         ac_model_path = os.path.join(self.DIR, "models", "AC_POWER_MODEL")
         
         dc_model = PipelineModel.load(dc_model_path)
         ac_model = PipelineModel.load(ac_model_path)
 
-        month = int(input("Enter month: "))
-        day = int(input("Enter day: "))
-        ambient_temperature = float(input("Enter ambient temperature: "))
-        irradiation = float(input("Enter irradiation: "))
-
-        module_temperature = self.predictModuleTemperature(ambient_temperature, irradiation)
-        print(f"Predicted Module Temperature: {module_temperature}")
         if module_temperature is None:
-            return
-        
+            return None, None
+
         InputRow = Row("month", "day_of_month", "AMBIENT_TEMPERATURE", "MODULE_TEMPERATURE", "IRRADIATION")
         input_row = InputRow(month, day, ambient_temperature, module_temperature, irradiation)
 
@@ -147,17 +149,18 @@ class EnergyPrediction(object):
         dc_pred = dc_model.transform(input_df).select("prediction").first()[0]
         ac_pred = ac_model.transform(input_df).select("prediction").first()[0]
 
-        print(f"DC Prediction: {dc_pred}")
-        print(f"AC Prediction: {ac_pred}")
+        return dc_pred, ac_pred
+
 
     @ExceptionHandelling
     def dataGeneration(self, latitude: float = 17.3850, longitude: float =  78.4867) -> pd.DataFrame:
-        dataframe: pd.DataFrame = self.getWeatherData(latitude, longitude, days=5)
+        dataframe: pd.DataFrame = self.getWeatherData(latitude, longitude, days=1)
         if dataframe is None:
             logging.error("Failed to fetch weather data.")
             return None
         logging.info("REAL TIME WEATHER DATA")
         #NOTE.: The weather API is giving irradiance in W/m², we need to convert it to kW/m² -> kWh_per_m2 = (irradiance_W_per_m2) * (15 / 60) / 1000
+        starttime = datetime.datetime.now()
         dataframe['IRRADIATION (kWh/m²)'] = (dataframe['Irradiance (W/m²)'] * (15 / 60)) / 1000
         moduleTemperature = list()
         for index, row in dataframe.iterrows():
@@ -169,6 +172,25 @@ class EnergyPrediction(object):
             else:
                 moduleTemperature.append(None)
         dataframe['MODULE_TEMPERATURE'] = moduleTemperature
+        print(dataframe.head(10))
+        print(dataframe.info())
+        #TODO: add new column DC current and AC current usinf the self.ModelPrediction method
+        for index, row in dataframe.iterrows():
+            ambient_temperature = row['Ambient Temp (°C)']
+            irradiation = row['IRRADIATION (kWh/m²)']
+            module_temperature = row['MODULE_TEMPERATURE']
+            month = int(row['Timestamp'].month)
+            day = int(row['Timestamp'].day)
+            if pd.isna(module_temperature):
+                continue
+            dc_current, ac_current = self.ModelPrediction(ambient_temperature, irradiation, module_temperature, month, day)
+            dataframe.at[index, 'DC_CURRENT'] = dc_current
+            dataframe.at[index, 'AC_CURRENT'] = ac_current
+        print("TIME TAKEN:",starttime - datetime.datetime.now())
+        dataframe.to_csv(os.path.join(self.DIR, "ProcessedModel_data.csv"), index=False)
+        logging.info("Data generation completed and saved to Processed_data.csv")
+        print(dataframe.to_string(index=False))
+        return dataframe
 
 if __name__ == "__main__":
     energy_prediction = EnergyPrediction()
