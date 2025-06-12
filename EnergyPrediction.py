@@ -15,6 +15,7 @@ import joblib
 import requests
 import datetime
 import time
+from markdown import markdown
 
 import warnings
 from sklearn.exceptions import InconsistentVersionWarning
@@ -40,7 +41,6 @@ class EnergyPrediction(object):
             pass
         self.GenerativeMODEL: genai.GenerativeModel = genai.GenerativeModel(
             model_name='models/gemini-2.0-flash',
-            generation_config={'application/memetype': 'text/plain'},
             safety_settings={},
             tools=None,
             system_instruction=None,
@@ -60,7 +60,7 @@ class EnergyPrediction(object):
     @ExceptionHandelling
     def getResponse(self, prompt: str) -> str:
         try:
-            response = self.GenerativeMODEL.generate_text(prompt)
+            response = self.GenerativeMODEL.generate_content(prompt)
             response.resolve()
             if response.text is None:
                 logging.error("No response text received from the model.")
@@ -145,7 +145,6 @@ class EnergyPrediction(object):
             return None
         
     @ExceptionHandelling
-    @ExceptionHandelling
     def ModelPrediction(self, ambient_temperature: float, irradiation: float, module_temperature: float) -> tuple:
         SCALARmodel = joblib.load(os.path.join(self.DIR, "models", "INPUT_SCALER.pkl"))
         ACmodel     = joblib.load(os.path.join(self.DIR, "models", "RF_AC_POWER_MODEL.pkl"))
@@ -164,7 +163,7 @@ class EnergyPrediction(object):
 
     @ExceptionHandelling
     def dataGeneration(self, latitude: float = 17.3850, longitude: float =  78.4867) -> pd.DataFrame:
-        dataframe: pd.DataFrame = self.getWeatherData(latitude, longitude, days=1)
+        dataframe: pd.DataFrame = self.getWeatherData(latitude, longitude, days=2)
         if dataframe is None:
             logging.error("Failed to fetch weather data.")
             return None
@@ -198,15 +197,74 @@ class EnergyPrediction(object):
         dataframe.to_csv(os.path.join(self.DIR, "ProcessedModel_data.csv"), index=False)
         logging.info("Data generation completed and saved to Processed_data.csv")
         print(dataframe.to_string(index=False))
+        print(dataframe.info())
+        # Save the dataframe to a CSV file
         return dataframe
     
-    def anamolyDetection(self, dataframe: pd.DataFrame) -> pd.DataFrame:
+    @ExceptionHandelling
+    def detect_anomalies(self, dataframe: pd.DataFrame, model, target_column, features):
+        X = dataframe[features]
+        predicted_power = model.predict(X)
+        error = abs(dataframe[target_column] - predicted_power)
+        threshold_error = error.quantile(0.95)
+        anomalies = dataframe[error > threshold_error]
+        return anomalies
+    
+    @ExceptionHandelling
+    def anomalyDetection(self, dataframe: pd.DataFrame) -> dict:
         if dataframe is None or dataframe.empty:
             logging.error("Dataframe is empty or None.")
             return None
-        
 
+        ACmodel = joblib.load(os.path.join(self.DIR, "models", "ac_model.pkl"))
+        DCmodel = joblib.load(os.path.join(self.DIR, "models", "dc_model.pkl"))
+        if not all([ACmodel, DCmodel]):
+            logging.error("One or more model files are missing. Please ensure all models are trained and saved.")
+            return None
 
+        # Rename columns to match the feature names used during training
+        dataframe = dataframe.rename(columns={
+            "IRRADIATION (kWh/m²)": "IRRADIATION",
+            "Ambient Temp (°C)": "AMBIENT_TEMPERATURE"
+        })
+
+        features = ["IRRADIATION", "AMBIENT_TEMPERATURE", "MODULE_TEMPERATURE"]
+
+        ac_anomalies = self.detect_anomalies(dataframe, ACmodel, "AC_CURRENT", features)
+        dc_anomalies = self.detect_anomalies(dataframe, DCmodel, "DC_CURRENT", features)
+
+        return {
+            "ac_anomalies": ac_anomalies,
+            "dc_anomalies": dc_anomalies
+    }
 if __name__ == "__main__":
     energy_prediction = EnergyPrediction()
-    energy_prediction.dataGeneration()
+    dataframe: pd.DataFrame = energy_prediction.dataGeneration()
+    anomalies = energy_prediction.anomalyDetection(dataframe)
+    if anomalies is not None:
+        ac_anomalies = anomalies["ac_anomalies"]
+        dc_anomalies = anomalies["dc_anomalies"]
+
+        prompt = f"""
+        We've detected anomalies in our solar power plant data. 
+        The anomalies are as follows:
+
+        AC Anomalies:
+        {ac_anomalies}
+
+        DC Anomalies:
+        {dc_anomalies}
+
+        Provide a detailed analysis of the possible causes of these anomalies and suggest potential actions to mitigate them.
+        Consider factors such as weather conditions, equipment performance, and maintenance schedules.And make the point small and concise.
+        """
+
+        print("AC Anomalies:")
+        print(ac_anomalies)
+        print("DC Anomalies:")
+        print(dc_anomalies)
+
+        analysis = energy_prediction.getResponse(prompt)
+        print(markdown.markdown(analysis))
+    else:
+        print("No anomalies detected or error occurred.")
