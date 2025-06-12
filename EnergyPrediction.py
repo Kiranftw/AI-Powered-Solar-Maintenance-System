@@ -12,18 +12,19 @@ from dotenv import load_dotenv, find_dotenv
 from functools import wraps
 import logging
 import joblib
-
-from pyspark.sql import SparkSession
-from pyspark.ml import PipelineModel
-from pyspark.sql import Row
 import requests
 import datetime
 import time
 
+import warnings
+from sklearn.exceptions import InconsistentVersionWarning
+warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class EnergyPrediction(object):
-    def __init__(self) -> None:
+    def __init__(self, modelname: str = "models/gemini-2.0-flash") -> None:
         load_dotenv(find_dotenv())
         self.DIR = os.path.dirname(os.path.abspath(__file__))
         for filename in os.listdir(self.DIR):
@@ -33,16 +34,17 @@ class EnergyPrediction(object):
         self.RegressionModel: LinearRegression = LinearRegression()
         self.ForestModel: RandomForestRegressor = RandomForestRegressor(n_estimators=100, random_state=42)
         self.modelpath = os.path.join(self.DIR, "energy_prediction_model.pkl")
-        self.sparksession = SparkSession.builder.appName("SolarMaintenence Model").getOrCreate()
         self.WEATHER_API = os.getenv("WEATHER_API")
         genai.configure(api_key=os.getenv("GENAI_API_KEY"))
         for model in genai.list_models():
-            print(model.name)
-        self.MODEL: genai.GenerativeModel = genai.GenerativeModel(
-            model_name = "gemini-1.5-flash",
-            generation_config = {"application/memetype": "text/plain"}
+            pass
+        self.GenerativeMODEL: genai.GenerativeModel = genai.GenerativeModel(
+            model_name='models/gemini-2.0-flash',
+            generation_config={'application/memetype': 'text/plain'},
+            safety_settings={},
+            tools=None,
+            system_instruction=None,
         )
-        print(self.model)
 
     @staticmethod
     def ExceptionHandelling(func):
@@ -54,6 +56,19 @@ class EnergyPrediction(object):
                 logging.error(f"An error occurred in {func.__name__}: {e}")
                 raise
         return wrapper
+    
+    @ExceptionHandelling
+    def getResponse(self, prompt: str) -> str:
+        try:
+            response = self.GenerativeMODEL.generate_text(prompt)
+            response.resolve()
+            if response.text is None:
+                logging.error("No response text received from the model.")
+                return None
+            return response.text
+        except Exception as e:
+            logging.error(f"Error generating response: {e}")
+            return None
    
     @ExceptionHandelling
     #NOTE: 
@@ -84,7 +99,6 @@ class EnergyPrediction(object):
             return None
 
         model = joblib.load(self.modelpath)
-
         input_df = pd.DataFrame([[ambient_temperature, irradiation]], 
                                 columns=['AMBIENT_TEMPERATURE', 'IRRADIATION'])
 
@@ -131,26 +145,22 @@ class EnergyPrediction(object):
             return None
         
     @ExceptionHandelling
-    def ModelPrediction(self, month: int, day: int, ambient_temperature: float, irradiation: float, module_temperature: float):
-        dc_model_path = os.path.join(self.DIR, "models", "DC_POWER_MODEL")
-        ac_model_path = os.path.join(self.DIR, "models", "AC_POWER_MODEL")
-        
-        dc_model = PipelineModel.load(dc_model_path)
-        ac_model = PipelineModel.load(ac_model_path)
+    @ExceptionHandelling
+    def ModelPrediction(self, ambient_temperature: float, irradiation: float, module_temperature: float) -> tuple:
+        SCALARmodel = joblib.load(os.path.join(self.DIR, "models", "INPUT_SCALER.pkl"))
+        ACmodel     = joblib.load(os.path.join(self.DIR, "models", "RF_AC_POWER_MODEL.pkl"))
+        DCmodel     = joblib.load(os.path.join(self.DIR, "models", "RF_DC_POWER_MODEL.pkl"))
+        if not all([SCALARmodel, ACmodel, DCmodel]):
+            logging.error("One or more model files are missing. Please ensure all models are trained and saved.")
+            return None
+        input_data = pd.DataFrame([[ambient_temperature, irradiation, module_temperature]])
 
-        if module_temperature is None:
-            return None, None
+        scaled_input = SCALARmodel.transform(input_data)
 
-        InputRow = Row("month", "day_of_month", "AMBIENT_TEMPERATURE", "MODULE_TEMPERATURE", "IRRADIATION")
-        input_row = InputRow(month, day, ambient_temperature, module_temperature, irradiation)
+        dc_prediction = DCmodel.predict(scaled_input)
+        ac_prediction = ACmodel.predict(scaled_input)
 
-        input_df = self.sparksession.createDataFrame([input_row])
-
-        dc_pred = dc_model.transform(input_df).select("prediction").first()[0]
-        ac_pred = ac_model.transform(input_df).select("prediction").first()[0]
-
-        return dc_pred, ac_pred
-
+        return dc_prediction[0], ac_prediction[0]
 
     @ExceptionHandelling
     def dataGeneration(self, latitude: float = 17.3850, longitude: float =  78.4867) -> pd.DataFrame:
@@ -179,11 +189,9 @@ class EnergyPrediction(object):
             ambient_temperature = row['Ambient Temp (°C)']
             irradiation = row['IRRADIATION (kWh/m²)']
             module_temperature = row['MODULE_TEMPERATURE']
-            month = int(row['Timestamp'].month)
-            day = int(row['Timestamp'].day)
             if pd.isna(module_temperature):
                 continue
-            dc_current, ac_current = self.ModelPrediction(ambient_temperature, irradiation, module_temperature, month, day)
+            dc_current, ac_current = self.ModelPrediction(ambient_temperature, irradiation, module_temperature)
             dataframe.at[index, 'DC_CURRENT'] = dc_current
             dataframe.at[index, 'AC_CURRENT'] = ac_current
         print("TIME TAKEN:",starttime - datetime.datetime.now())
@@ -191,6 +199,27 @@ class EnergyPrediction(object):
         logging.info("Data generation completed and saved to Processed_data.csv")
         print(dataframe.to_string(index=False))
         return dataframe
+    
+    def anamolyDetection(self, dataframe: pd.DataFrame) -> pd.DataFrame:
+        if dataframe is None or dataframe.empty:
+            logging.error("Dataframe is empty or None.")
+            return None
+        # Assuming 'MODULE_TEMPERATURE' is the column to check for anomalies
+        sns.boxplot(data=dataframe, x='MODULE_TEMPERATURE')
+        plt.title('Anomaly Detection in Module Temperature')
+        plt.show()
+        
+        # Simple anomaly detection using Z-score
+        dataframe['Z_SCORE'] = (dataframe['MODULE_TEMPERATURE'] - dataframe['MODULE_TEMPERATURE'].mean()) / dataframe['MODULE_TEMPERATURE'].std()
+        anomalies = dataframe[dataframe['Z_SCORE'].abs() > 3]
+        
+        if not anomalies.empty:
+            logging.info(f"Anomalies detected: {len(anomalies)}")
+            print(anomalies)
+        else:
+            logging.info("No anomalies detected.")
+        
+        return anomalies
 
 if __name__ == "__main__":
     energy_prediction = EnergyPrediction()
