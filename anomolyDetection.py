@@ -413,4 +413,4 @@ footer1, footer2, footer3 = st.columns(3)
 footer1.progress(int(efficiency), text="System Efficiency")
 footer2.metric("Energy Saved", f"{round(totalAC * 0.25, 2)} kWh")
 footer3.metric("Faults Detected", "24", "3 since yesterday")
-# fuck u uday 
+# FUCK U UDAY 
