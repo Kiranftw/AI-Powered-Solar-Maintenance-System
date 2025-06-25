@@ -1,0 +1,7 @@
+myenv/
+.venv/
+.env
+models/*
+*.pkl
+*.h5
+*.pt

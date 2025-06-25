@@ -1,1 +1,0 @@
-{"class":"org.apache.spark.ml.feature.VectorAssembler","timestamp":1747893860813,"sparkVersion":"3.5.5","uid":"VectorAssembler_7e295cc032ed","paramMap":{"inputCols":["month","day_of_month","AMBIENT_TEMPERATURE","MODULE_TEMPERATURE","IRRADIATION"],"outputCol":"features"},"defaultParamMap":{"handleInvalid":"error","outputCol":"VectorAssembler_7e295cc032ed__output"}}
